@@ -34,6 +34,7 @@ LOOKUP_COLUMNS = [
     "Max Number of Users",
     "Desking",
     "AIS Status",
+    "Rates & Residuals as Enabled",
     "Vin Feature Enabled",
 ]
 JUDGMENT_COLUMNS = []
@@ -67,6 +68,8 @@ PRODUCT_RULES = [
      "columns": [("AIS Status", "Yes")]},
     {"match": "Desking",
      "columns": [("Desking", "VinDesking (New Desking Only)")]},
+    {"match": "Rates and Residuals powered by DealerTrack",
+     "columns": [("Rates & Residuals as Enabled", "Yes")]},
     {"match": "Vinessa",
      "codes": ["SVC-VINESSA", "SVC-VINESSA-BETA-PILOT"], "codes_mode": "OR"},
 ]
@@ -186,15 +189,18 @@ def lookup_vinsolutions(page, key, row):
     result["ILM Status"] = _checked(ctx, "#MainContent__ILMEnabled")
     result["Full Crm Status"] = _checked(ctx, "#MainContent__CRMEnabled")
     result["AIS Status"] = _checked(ctx, "#MainContent_m_AISEnabled")
+    rr = ctx.query_selector("#MainContent_chkRREnabled")
+    result["Rates & Residuals as Enabled"] = (
+        "Yes" if (rr is not None and rr.is_checked()) else "Not found")
     result["Max Number of Users"] = (
         _value(ctx, "#ctl00_MainContent_m_txt_MaxNumberOfUsers")
         or _value(ctx, "#ctl00_MainContent_m_txt_MaxNumberOfUsers_ClientState")
     )
     result["Desking"] = _selected_text(ctx, "#MainContent_m_DeskingAccess")
-    log.info("[%s] ILM=%s FullCRM=%s AIS=%s MaxUsers=%r Desking=%r", key,
+    log.info("[%s] ILM=%s FullCRM=%s AIS=%s R&R=%s MaxUsers=%r Desking=%r", key,
              result["ILM Status"], result["Full Crm Status"],
-             result["AIS Status"], result["Max Number of Users"],
-             result["Desking"])
+             result["AIS Status"], result["Rates & Residuals as Enabled"],
+             result["Max Number of Users"], result["Desking"])
 
     # ----- Phase 2: determine "Vin Feature Enabled" -----
     product_name = (row.get("PRODUCT_NAME") or "").strip()
