@@ -1,5 +1,5 @@
 """
-audit_automation.py  --  VinSolutions audit (Phase 1 + Phase 2)
+audit_automation.py  --  VinSolutions audit (Phases 1-4)
 
 One browser, one login, all rows. For each row: open dealer search, select
 the dealer, read status + name, go to CRM Admin Settings and pull values,
@@ -13,6 +13,7 @@ RUN:           python audit_automation.py
 """
 
 import csv
+import re
 import sys
 import time
 import random
@@ -36,6 +37,7 @@ LOOKUP_COLUMNS = [
     "AIS Status",
     "Rates & Residuals as Enabled",
     "Vin Feature Enabled",
+    "Inventory",
 ]
 JUDGMENT_COLUMNS = []
 
@@ -51,17 +53,38 @@ FEATURE_IDS_COL = "Dealer Feature ID(s)"
 MATCH_ALL_FEATURE_IDS = True   # True = AND (all IDs must be enabled)
                                # False = OR (any one ID enabled is enough)
 
-# Value written to the "Vin Feature Enabled" column:
-FEATURE_ENABLED_VALUE = "Yes"        # when the feature is enabled
-FEATURE_NOT_FOUND_VALUE = "Not found"  # when it is not
+# Values written to the "Vin Feature Enabled" column:
+FEATURE_ENABLED_VALUE = "Yes"           # the feature is enabled
+FEATURE_NOT_FOUND_VALUE = "Not found"   # checked, but not enabled
+FEATURE_CHECK_VALUE = "Check manually"  # no rule and not found in the mapping CSV
 
-# Per-product rules. The FIRST rule whose "match" text appears in PRODUCT_NAME
-# wins. Two kinds:
-#   columns -> decided from settings already read (all must equal their value)
-#   codes   -> decided from the Dealer Features list (mode AND or OR)
-# If no rule matches, the default path runs: PRODUCTCODE direct, else the
-# CSV mapping's Dealer Feature ID(s) with MATCH_ALL_FEATURE_IDS.
+# Hardcoded per-product OVERRIDES. The FIRST rule whose "match" text appears in
+# PRODUCT_NAME wins. Kinds:
+#   columns     -> decided from settings already read (all must equal value)
+#   min_numeric -> a settings value must be greater than the given number
+#   codes       -> decided from the Dealer Features list (mode AND or OR)
+# A rule may combine "columns" and "min_numeric" (all conditions must hold).
+# Matching is FIRST-WINS by substring, so list the most specific products
+# first (e.g. "CRM/ILM Limited Users..." before the generic "CRM/ILM").
+# If NO rule matches, the product is looked up by name in the mapping CSV and
+# its "Dealer Feature ID(s)" expression is evaluated (see _determine_feature_
+# enabled). Not in the mapping -> "Check manually".
 PRODUCT_RULES = [
+    # ----- Phase 4 additions (specific products first) -----
+    # CRM/ILM Limited Users (10 Users Max): ILM on + CRM on + at least one
+    # licensed user (Max Number of Users > 0).
+    {"match": "CRM/ILM Limited Users (10 Users Max)",
+     "columns": [("ILM Status", "Yes"), ("Full Crm Status", "Yes")],
+     "min_numeric": [("Max Number of Users", 0)]},
+    # Customer Texting Unlimited MMS Texts: enabled feature code on the
+    # Dealer Features list.
+    {"match": "Customer Texting Unlimited MMS Texts",
+     "codes": ["SVC-TXTMMSUNLMTD"], "codes_mode": "OR"},
+    # Automotive Marketing Platform (Direct Email Campaign): feature code only.
+    {"match": "Automotive Marketing Platform powered by VinSolutions "
+              "(Direct Email Campaign)",
+     "codes": ["SVC-TARGETELITEWMS"], "codes_mode": "OR"},
+    # ----- existing rules -----
     {"match": "CRM/ILM",
      "columns": [("Full Crm Status", "Yes"), ("ILM Status", "Yes")]},
     {"match": "AIS CRM Integration",
@@ -73,6 +96,22 @@ PRODUCT_RULES = [
     {"match": "Vinessa",
      "codes": ["SVC-VINESSA", "SVC-VINESSA-BETA-PILOT"], "codes_mode": "OR"},
 ]
+
+# ---- Mapping expression vocabulary -------------------------------------
+# The mapping CSV "Dealer Feature ID(s)" column is a boolean expression whose
+# tokens are either feature codes (SVC-*, MKT-*) or one of these STATE tokens,
+# which are tested against the columns we already captured. Spacing varies in
+# the data ("ILM Enabled" vs "ILMEnabled"), so we compare with spaces removed.
+DESKING_ENABLED_TEXT = "VinDesking (New Desking Only)"
+STATE_TOKENS = {
+    "ILMEnabled": ("ILM Status", "yes"),
+    "FullCRMEnabled": ("Full Crm Status", "yes"),
+    "AISEnabled": ("AIS Status", "yes"),
+    "RatesAndResidualsEnabled": ("Rates & Residuals as Enabled", "yes"),
+    "DeskingAccessEnabled": ("Desking", "desking"),
+    "MaxNumberOfUserGreaterThan0": ("Max Number of Users", "gt0"),
+}
+_STATE_NORM = {k.replace(" ", "").lower(): v for k, v in STATE_TOKENS.items()}
 
 LOG_FILE = "audit_log.txt"
 _MAPPING = []
@@ -145,6 +184,7 @@ def lookup_vinsolutions(page, key, row):
     try:
         page.wait_for_selector("span.ccrm-dealer-header-display-title-name",
                                state="visible", timeout=10000)
+        page.wait_for_timeout(2000)
     except Exception:
         page.wait_for_timeout(2000)
 
@@ -203,25 +243,89 @@ def lookup_vinsolutions(page, key, row):
              result["Max Number of Users"], result["Desking"])
 
     # ----- Phase 2: determine "Vin Feature Enabled" -----
+    _determine_feature_enabled(page, key, row, result, selected_dealer)
+
+    # ----- Phase 3: Vehicle Settings > Inventory Access -----
+    result["Inventory"] = _read_inventory_access(page, key, selected_dealer)
+
+    return result
+
+
+def _determine_feature_enabled(page, key, row, result, selected_dealer):
+    """Set result['Vin Feature Enabled'] (hybrid model).
+
+      1. A hardcoded PRODUCT_RULES match wins - settings columns, or explicit
+         feature codes. These are our overrides.
+      2. Otherwise, look the product up by name in the mapping CSV and evaluate
+         its "Dealer Feature ID(s)" boolean expression.
+
+    Expression tokens are either CRM-column STATE tokens (tested against the
+    values we already read) or feature codes (tested against the Dealer
+    Features enabled list). Operators: AND (all), OR (any), comma == AND.
+    Not in the mapping / unparseable -> "Check manually".
+    """
     product_name = (row.get("PRODUCT_NAME") or "").strip()
-    productcode = (row.get("PRODUCTCODE") or "").strip()
     rule = _match_rule(product_name)
 
-    # (a) column rule -> decide from settings already read; no features page
-    if rule and "columns" in rule:
-        checks = [(result.get(c, "") == v) for c, v in rule["columns"]]
-        decided = all(checks)
-        log.info("[%s] rule '%s' columns=%s -> %s", key, rule["match"],
-                 [(c, result.get(c, ""), v) for c, v in rule["columns"]],
+    # (a) hardcoded settings rule -> decide from columns already read; no page
+    if rule and ("columns" in rule or "min_numeric" in rule):
+        col_checks = [(result.get(c, "") == v)
+                      for c, v in rule.get("columns", [])]
+        num_checks = [(_as_number(result.get(c, "")) > threshold)
+                      for c, threshold in rule.get("min_numeric", [])]
+        decided = all(col_checks) and all(num_checks)
+        log.info("[%s] rule '%s' columns=%s numeric=%s -> %s", key,
+                 rule["match"],
+                 [(c, result.get(c, ""), "==", v)
+                  for c, v in rule.get("columns", [])],
+                 [(c, result.get(c, ""), ">", t)
+                  for c, t in rule.get("min_numeric", [])],
                  decided)
         result["Vin Feature Enabled"] = (
             FEATURE_ENABLED_VALUE if decided else FEATURE_NOT_FOUND_VALUE)
-        log.info("[%s] Vin Feature Enabled=%s (column rule)",
+        log.info("[%s] Vin Feature Enabled=%s (column/numeric rule)",
                  key, result["Vin Feature Enabled"])
-        return result
+        return
 
-    # (b) need the Dealer Features list (code rule or default mapping)
-    log.info("[%s] opening Dealer Features (PRODUCTCODE=%r)", key, productcode)
+    # Build the boolean expression to evaluate.
+    if rule and "codes" in rule:                       # hardcoded code override
+        joiner = " OR " if rule.get("codes_mode", "OR").upper() == "OR" else " AND "
+        expr = joiner.join(rule["codes"])
+        source = "rule '%s'" % rule["match"]
+    else:                                              # mapping by product name
+        expr = _lookup_expression(product_name)
+        source = "mapping"
+        if not expr:
+            result["Vin Feature Enabled"] = FEATURE_CHECK_VALUE
+            log.info("[%s] no rule and no mapping for %r -> %s",
+                     key, product_name, FEATURE_CHECK_VALUE)
+            return
+
+    mode, tokens = _parse_expression(expr)
+    if mode is None or not tokens:
+        result["Vin Feature Enabled"] = FEATURE_CHECK_VALUE
+        log.warning("[%s] cannot parse expression %r (%s) -> %s",
+                    key, expr, source, FEATURE_CHECK_VALUE)
+        return
+
+    # Open the Dealer Features page only if a token is a feature code.
+    needs_features = any(not _is_state_token(t) for t in tokens)
+    enabled_texts = (_read_enabled_features(page, key, selected_dealer)
+                     if needs_features else [])
+
+    decided = _eval_expression_tokens(mode, tokens, result, enabled_texts)
+    log.info("[%s] expr=%r mode=%s tokens=%s (%s) -> %s",
+             key, expr, mode, tokens, source, decided)
+    result["Vin Feature Enabled"] = (
+        FEATURE_ENABLED_VALUE if decided else FEATURE_NOT_FOUND_VALUE)
+    log.info("[%s] Vin Feature Enabled=%s (%s)",
+             key, result["Vin Feature Enabled"], source)
+
+
+def _read_enabled_features(page, key, selected_dealer):
+    """Open Admin > Selected Dealer > Dealer Features and return the list of
+    enabled-feature texts (used to test feature codes)."""
+    log.info("[%s] opening Dealer Features", key)
     page.click("#tab-admin")
     page.wait_for_timeout(800)
     page.wait_for_selector(selected_dealer, state="visible", timeout=10000)
@@ -235,7 +339,7 @@ def lookup_vinsolutions(page, key, row):
     ])
     if feat is None:
         log.error("[%s] could not find Dealer Features", key)
-        return result
+        return []
     try:
         feat.scroll_into_view_if_needed()
     except Exception:
@@ -250,32 +354,113 @@ def lookup_vinsolutions(page, key, row):
         enabled_texts = [sp.inner_text().strip()
                          for sp in spans if sp.inner_text().strip()]
     log.info("[%s] enabled features found: %d", key, len(enabled_texts))
+    return enabled_texts
 
-    matched = False
-    if rule and "codes" in rule:                       # code rule (AND/OR)
-        codes = rule["codes"]
-        mode = rule.get("codes_mode", "OR").upper()
-        checks = [_is_in_enabled(c, enabled_texts) for c in codes]
-        matched = all(checks) if mode == "AND" else any(checks)
-        log.info("[%s] rule '%s' codes=%s checks=%s mode=%s -> %s", key,
-                 rule["match"], codes, checks, mode, matched)
-    elif productcode and _is_in_enabled(productcode, enabled_texts):  # direct
-        matched = True
-        log.info("[%s] PRODUCTCODE matched directly", key)
-    else:                                              # CSV mapping fallback
-        feature_ids = _lookup_feature_ids(product_name)
-        log.info("[%s] mapping name=%r -> ids=%s", key, product_name,
-                 feature_ids)
-        if feature_ids:
-            checks = [_is_in_enabled(fid, enabled_texts) for fid in feature_ids]
-            matched = all(checks) if MATCH_ALL_FEATURE_IDS else any(checks)
-            log.info("[%s] id checks=%s mode=%s -> %s", key, checks,
-                     "AND" if MATCH_ALL_FEATURE_IDS else "OR", matched)
 
-    result["Vin Feature Enabled"] = (
-        FEATURE_ENABLED_VALUE if matched else FEATURE_NOT_FOUND_VALUE)
-    log.info("[%s] Vin Feature Enabled=%s", key, result["Vin Feature Enabled"])
-    return result
+def _parse_expression(expr):
+    """Split a mapping expression into (mode, tokens).
+
+    mode is 'AND' or 'OR'; a comma is treated as AND. Mixed AND+OR is not
+    supported -> returns (None, []) so the caller flags it for review.
+    """
+    e = (expr or "").strip()
+    if not e:
+        return None, []
+    has_or = re.search(r"\bOR\b", e) is not None
+    has_and = re.search(r"\bAND\b", e) is not None
+    if has_or and has_and:
+        return None, []
+    if has_or:
+        parts = re.split(r"\bOR\b", e)
+        mode = "OR"
+    else:
+        parts = re.split(r"\bAND\b|,", e)   # comma == AND
+        mode = "AND"
+    tokens = [p.strip() for p in parts if p.strip()]
+    return mode, tokens
+
+
+def _is_state_token(token):
+    return (token or "").strip().replace(" ", "").lower() in _STATE_NORM
+
+
+def _eval_token(token, result, enabled_texts):
+    """True/False for one token. A known STATE token is checked against the
+    captured column; anything else is treated as a feature code."""
+    spec = _STATE_NORM.get((token or "").strip().replace(" ", "").lower())
+    if spec:
+        col, test = spec
+        val = result.get(col, "")
+        if test == "yes":
+            return val == "Yes"
+        if test == "gt0":
+            return _as_number(val) > 0
+        if test == "desking":
+            return val == DESKING_ENABLED_TEXT
+    return _is_in_enabled(token, enabled_texts)
+
+
+def _eval_expression_tokens(mode, tokens, result, enabled_texts):
+    vals = [_eval_token(t, result, enabled_texts) for t in tokens]
+    return all(vals) if mode == "AND" else any(vals)
+
+
+def _read_inventory_access(page, key, selected_dealer):
+    """Navigate Admin > Selected Dealer > Vehicle Settings > Inventory and read
+    the inventory-access value. Logs the HTML so we can pin the exact element."""
+    log.info("[%s] opening Vehicle Settings", key)
+    try:
+        page.click("#tab-admin")
+        page.wait_for_timeout(800)
+        page.wait_for_selector(selected_dealer, state="visible", timeout=10000)
+        page.hover(selected_dealer)
+        page.wait_for_timeout(600)
+        veh = _find_first(page, [
+            "#navigation-sub-menu-tab-admin-selected-dealer-vehicle-settings",
+            '[data-menu-id="navigation-sub-menus-navigation-sub-menu-'
+            'tab-admin-selected-dealer-vehicle-settings"]',
+        ])
+        if veh is None:
+            log.error("[%s] Vehicle Settings not found", key)
+            return ""
+        try:
+            veh.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        veh.click()
+        page.wait_for_timeout(1500)
+    except Exception as e:
+        log.warning("[%s] vehicle settings nav error: %s", key, e)
+        return ""
+
+    # Click the Inventory tab link, then read the inventory-access input.
+    inv_tab = "a[href*='/settings/Inventory/']"
+    vctx = _ctx_with(page, inv_tab, total_wait=8000)
+    if vctx is None:
+        log.warning("[%s] Inventory tab link NOT found", key)
+        return ""
+    try:
+        vctx.click(inv_tab)
+    except Exception as e:
+        log.warning("[%s] could not click Inventory tab: %s", key, e)
+        return ""
+
+    # Wait for the inventory-access input to appear, then read its value.
+    input_sel = "#SettingTypeinventory-access-setting"
+    ictx = _ctx_with(page, input_sel, total_wait=8000)
+    if ictx is None:
+        log.warning("[%s] inventory-access input NOT found", key)
+        return ""
+
+    el = ictx.query_selector(input_sel)
+    value = ""
+    if el is not None:
+        try:
+            value = (el.input_value() or "").strip()
+        except Exception:
+            value = (el.get_attribute("value") or "").strip()
+    log.info("[%s] inventory value read: %r", key, value)
+    return value
 
 
 def _toggle_active_dealers(page):
@@ -320,8 +505,16 @@ def _is_in_enabled(value, enabled_texts):
     return any(v == t.lower() or v in t.lower() for t in enabled_texts)
 
 
+def _as_number(value):
+    """Parse a settings value like '10' to a number; blank/non-numeric -> 0."""
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def load_mapping():
-    """Load the CSV helper once: name -> list of Dealer Feature IDs."""
+    """Load the CSV helper once: name -> raw 'Dealer Feature ID(s)' expression."""
     global _MAPPING
     path = Path(MAPPING_FILE)
     if not path.exists():
@@ -330,7 +523,7 @@ def load_mapping():
         return
     data = []
     with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, delimiter=_detect_delimiter(path))
         cols = reader.fieldnames or []
         if NAME_COL not in cols or FEATURE_IDS_COL not in cols:
             log.error("mapping columns not found. Headers seen: %s", cols)
@@ -340,31 +533,32 @@ def load_mapping():
             name = (r.get(NAME_COL) or "").strip()
             if not name:
                 continue
-            ids = r.get(FEATURE_IDS_COL) or ""
-            id_list = [x.strip() for x in str(ids).split(",") if x.strip()]
-            data.append((name, id_list))
+            expr = (r.get(FEATURE_IDS_COL) or "").strip()
+            data.append((name, expr))
     _MAPPING = data
     log.info("loaded %d mapping rows from %s", len(_MAPPING), MAPPING_FILE)
 
 
-def _lookup_feature_ids(product_name):
+def _lookup_expression(product_name):
+    """Return the raw 'Dealer Feature ID(s)' expression for a product name:
+    exact match first, then substring, then a close fuzzy match. '' if none."""
     if not product_name or not _MAPPING:
-        return []
+        return ""
     target = product_name.strip().lower()
-    for name, ids in _MAPPING:
+    for name, expr in _MAPPING:
         if name.lower() == target:
-            return ids
-    for name, ids in _MAPPING:
+            return expr
+    for name, expr in _MAPPING:
         n = name.lower()
         if target in n or n in target:
-            return ids
+            return expr
     names = [name for name, _ in _MAPPING]
     close = difflib.get_close_matches(product_name, names, n=1, cutoff=0.8)
     if close:
-        for name, ids in _MAPPING:
+        for name, expr in _MAPPING:
             if name == close[0]:
-                return ids
-    return []
+                return expr
+    return ""
 
 
 def _find_first(page, selectors, timeout=4000):
@@ -496,15 +690,31 @@ SYSTEMS = [lookup_vinsolutions]
 # ======================================================================
 # ENGINE
 # ======================================================================
+def _detect_delimiter(path):
+    """Guess the CSV delimiter from the header line (comma/semicolon/tab/pipe)."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            first = f.readline()
+    except Exception:
+        return ","
+    counts = {d: first.count(d) for d in [",", ";", "\t", "|"]}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
+
+
 def read_rows(path):
+    delim = _detect_delimiter(path)
     with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        return list(reader), list(reader.fieldnames)
+        reader = csv.DictReader(f, delimiter=delim)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+    log.info("CSV delimiter=%r; columns found: %s", delim, fieldnames)
+    return rows, fieldnames, delim
 
 
-def write_rows(path, rows, fieldnames):
+def write_rows(path, rows, fieldnames, delimiter=","):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=delimiter)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -544,7 +754,18 @@ def main():
     if not path.exists():
         sys.exit(f"CSV not found: {CSV_PATH}")
 
-    rows, fieldnames = read_rows(path)
+    rows, fieldnames, delim = read_rows(path)
+
+    if KEY_COLUMN not in fieldnames:
+        log.error("Key column %r NOT in CSV. Columns are: %s",
+                  KEY_COLUMN, fieldnames)
+        sys.exit(f"'{KEY_COLUMN}' column not found - check the headers logged "
+                 f"above (wrong delimiter or different column name?).")
+
+    nonempty = sum(1 for r in rows if (r.get(KEY_COLUMN) or "").strip())
+    log.info("%d rows total; %d have a %s value (%d blank)",
+             len(rows), nonempty, KEY_COLUMN, len(rows) - nonempty)
+
     for col in LOOKUP_COLUMNS + JUDGMENT_COLUMNS:
         if col not in fieldnames:
             fieldnames.append(col)
@@ -574,7 +795,7 @@ def main():
                 continue
             log.info("[%d/%d] === processing %s ===", i, total, key)
             fill_row(page, row)
-            write_rows(path, rows, fieldnames)
+            write_rows(path, rows, fieldnames, delim)
             time.sleep(0.5)
 
         ctx.close()
