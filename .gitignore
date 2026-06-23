@@ -55,4 +55,8 @@ test-results/
 # Misc
 .python-version
 browser_profile/
+coat_profile/
+
+# Logs
+*_log.txt
 
