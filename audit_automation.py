@@ -522,7 +522,7 @@ def load_mapping():
         _MAPPING = []
         return
     data = []
-    with open(path, newline="", encoding="utf-8-sig") as f:
+    with open(path, newline="", encoding=_read_encoding(path)) as f:
         reader = csv.DictReader(f, delimiter=_detect_delimiter(path))
         cols = reader.fieldnames or []
         if NAME_COL not in cols or FEATURE_IDS_COL not in cols:
@@ -690,10 +690,32 @@ SYSTEMS = [lookup_vinsolutions]
 # ======================================================================
 # ENGINE
 # ======================================================================
+_ENC_CACHE = {}
+
+
+def _read_encoding(path):
+    """Return the encoding to read a CSV with: UTF-8 (with optional BOM) when
+    it decodes cleanly, otherwise Windows-1252. Excel often re-saves CSVs as
+    Windows-1252, where byte 0xA0 (non-breaking space) is NOT valid UTF-8.
+    Cached per path so we only probe (and warn) once per run."""
+    key = str(path)
+    if key in _ENC_CACHE:
+        return _ENC_CACHE[key]
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            f.read()
+        enc = "utf-8-sig"
+    except UnicodeDecodeError:
+        log.warning("%s is not UTF-8; reading as Windows-1252 (cp1252)", path)
+        enc = "cp1252"
+    _ENC_CACHE[key] = enc
+    return enc
+
+
 def _detect_delimiter(path):
     """Guess the CSV delimiter from the header line (comma/semicolon/tab/pipe)."""
     try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
+        with open(path, newline="", encoding=_read_encoding(path)) as f:
             first = f.readline()
     except Exception:
         return ","
@@ -704,7 +726,7 @@ def _detect_delimiter(path):
 
 def read_rows(path):
     delim = _detect_delimiter(path)
-    with open(path, newline="", encoding="utf-8-sig") as f:
+    with open(path, newline="", encoding=_read_encoding(path)) as f:
         reader = csv.DictReader(f, delimiter=delim)
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
