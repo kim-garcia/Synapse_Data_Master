@@ -1,0 +1,88 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+share/python-wheels/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+venv.bak/
+env.bak/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Playwright artifacts
+playwright-report/
+test-results/
+.playwright/
+
+# IDE / editor
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Misc
+.python-version
+browser_profile/
+coat_profile/
+
+# Logs
+*_log.txt
+*.csv
+
+sf_profile/
+
+# --- Sensitive / local-only (added for the Synapse work) ---
+# Virtual environments that live in this repo
+audit-env/
+databricks-env/
+
+# Secrets: never commit API keys
+.env
+*.key
+secrets.toml
+.streamlit/secrets.toml
+
+# Debug screenshots can show real customer data on screen
+*.png
+coat_debug.png
+
+# Runtime state
+run_status.json
+
+# Office lock files
+~$*
+
+# Internal documents (uncomment to share with the team)
+*.pdf
