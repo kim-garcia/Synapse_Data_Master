@@ -40,7 +40,7 @@ PRICE_COLUMN    = "ASSET_TOTAL_PRICE"           # confirms the matched row
 PRICE_TOLERANCE = 0.011                         # <= 1 cent difference is a match
 
 PROFILE_DIR     = "sf_profile"
-BROWSER_CHANNEL = "msedge"   # "msedge" (Windows VDI / SSO) or "chrome"
+BROWSER_CHANNEL = "chrome"   # "msedge" (Windows VDI / SSO) or "chrome"
 LOG_FILE        = "sf_audit_log.txt"
 WINDOW          = {"width": 1920, "height": 1080}
 CDP_PORT        = 9222   # fixed port so Playwright can attach to the same browser

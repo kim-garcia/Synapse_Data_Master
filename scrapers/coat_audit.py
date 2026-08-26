@@ -36,7 +36,7 @@ LOOKUP_COLUMNS = ["COAT Status"]
 JUDGMENT_COLUMNS = []
 
 PROFILE_DIR = "coat_profile"                 # separate from the VinSolutions one
-BROWSER_CHANNEL = "msedge"   # "msedge" (Windows VDI / SSO) or "chrome"
+BROWSER_CHANNEL = "chrome"   # "msedge" (Windows VDI / SSO) or "chrome"
 CDP_PORT = 9223              # 9222 is sf_audit's; keep them distinct
 HEADLESS = False
 WINDOW = {"width": 1920, "height": 1080}
