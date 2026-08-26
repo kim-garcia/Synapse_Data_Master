@@ -27,6 +27,7 @@ def main():
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             s.PROFILE_DIR,
+            channel="chrome",
             headless=False,
             viewport=s.WINDOW,
             args=[f"--window-size={s.WINDOW['width']},{s.WINDOW['height']}"],

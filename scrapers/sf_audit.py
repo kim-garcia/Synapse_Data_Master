@@ -19,7 +19,9 @@ RUN:   python sf_audit.py
 """
 
 import csv
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -38,6 +40,7 @@ PRICE_COLUMN    = "ASSET_TOTAL_PRICE"           # confirms the matched row
 PRICE_TOLERANCE = 0.011                         # <= 1 cent difference is a match
 
 PROFILE_DIR     = "sf_profile"
+BROWSER_CHANNEL = "msedge"   # "msedge" (Windows VDI / SSO) or "chrome"
 LOG_FILE        = "sf_audit_log.txt"
 WINDOW          = {"width": 1920, "height": 1080}
 CDP_PORT        = 9222   # fixed port so Playwright can attach to the same browser
@@ -70,6 +73,72 @@ STEP_PAUSE      = 2      # seconds to pause after each step (visual check)
 # LOGGING
 # ======================================================================
 log = logging.getLogger("sf_audit")
+
+
+def get_browser_executable():
+    """Return the browser executable to drive, honouring BROWSER_CHANNEL.
+
+    On a Windows VDI, Conditional Access refuses a blank Chrome profile
+    because it cannot present device identity. Edge integrates with the
+    machine's PRT natively, so it passes where Chrome does not. Set
+    BROWSER_CHANNEL = "chrome" to go back to Chrome.
+    """
+    edge_first = BROWSER_CHANNEL == "msedge"
+    names = ["msedge", "chrome"] if edge_first else ["chrome", "msedge"]
+    candidates = []
+    for name in names:
+        if name == "msedge":
+            candidates += [shutil.which("msedge")]
+            if os.name == "nt":
+                roots = [
+                    os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                    os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                    os.environ.get("LOCALAPPDATA"),
+                ]
+                candidates += [
+                    str(Path(r) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+                    for r in roots if r
+                ]
+            elif sys.platform == "darwin":
+                candidates += [
+                    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                ]
+            else:
+                candidates += ["/usr/bin/microsoft-edge"]
+        else:
+            candidates += [
+                shutil.which("google-chrome"),
+                shutil.which("google-chrome-stable"),
+                shutil.which("chrome"),
+            ]
+            if os.name == "nt":
+                roots = [
+                    os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                    os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                    os.environ.get("LOCALAPPDATA"),
+                ]
+                candidates += [
+                    str(Path(r) / "Google" / "Chrome" / "Application" / "chrome.exe")
+                    for r in roots if r
+                ]
+            elif sys.platform == "darwin":
+                candidates += [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                ]
+            else:
+                candidates += ["/usr/bin/google-chrome", "/opt/google/chrome/chrome"]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    raise FileNotFoundError(
+        "Neither Microsoft Edge nor Google Chrome was found. "
+        "Install one or add it to PATH."
+    )
+
+
+# Backwards-compatible alias.
+get_chrome_executable = get_browser_executable
 
 
 def setup_logging():
@@ -1188,10 +1257,9 @@ def main():
     usable = sum(1 for r in rows if (r.get(KEY_COLUMN) or "").strip())
     log.info("%d rows total; %d have %s", len(rows), usable, KEY_COLUMN)
 
-    # ── Phase 1: launch Chromium with a CDP port for SSO login ────────────
-    pw_mgr = sync_playwright().start()
-    browser_path = pw_mgr.chromium.executable_path
-    pw_mgr.stop()
+    # ── Phase 1: launch the installed Chrome browser with a CDP port for
+    # SSO login so the same profile is reused for automation. ─────────────
+    browser_path = get_chrome_executable()
 
     profile_abs = str(Path(PROFILE_DIR).resolve())
 
@@ -1217,7 +1285,10 @@ def main():
 
     # ── Phase 2: attach to the SAME browser over CDP (no new window) ──────
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+        browser = p.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{CDP_PORT}",
+            timeout=30000,
+        )
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
         page = None
         for pg in ctx.pages:

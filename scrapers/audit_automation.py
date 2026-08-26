@@ -8,12 +8,15 @@ CSV mapping fallback). Saves after every row; resumes if it crashes.
 
 Logs every step to the console AND to audit_log.txt.
 
-SETUP (once):  pip install playwright   then:  playwright install chromium
+SETUP (once):  pip install playwright
+               (no 'playwright install' needed - channel="chrome" drives
+                the real Chrome already installed, not a bundled build)
 RUN:           python audit_automation.py
 """
 
 import csv
 import re
+import shutil
 import sys
 import time
 import random
@@ -118,6 +121,22 @@ _STATE_NORM = {k.replace(" ", "").lower(): v for k, v in STATE_TOKENS.items()}
 
 LOG_FILE = "audit_log.txt"
 _MAPPING = []
+
+
+def get_chrome_executable():
+    """Return the installed Chrome executable for this machine."""
+    candidates = [
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    raise FileNotFoundError(
+        "Google Chrome was not found. Install Chrome or add it to PATH."
+    )
 
 # ======================================================================
 # LOGGING
@@ -849,6 +868,7 @@ def main():
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             PROFILE_DIR,
+            channel="chrome",          # real Chrome, not bundled Chromium
             headless=HEADLESS,
             viewport=WINDOW,
             args=[f"--window-size={WINDOW['width']},{WINDOW['height']}"],

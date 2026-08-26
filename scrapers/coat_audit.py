@@ -11,11 +11,15 @@ once.
 
 Logs every step to the console AND to coat_log.txt.
 
-SETUP (once):  pip install playwright   then:  playwright install chromium
+SETUP (once):  pip install playwright
+               (no 'playwright install' needed - this drives the real
+                Edge/Chrome already on the machine, not a bundled build)
 RUN:           python coat_audit.py
 """
 
 import csv
+import os
+import shutil
 import sys
 import time
 import random
@@ -32,6 +36,8 @@ LOOKUP_COLUMNS = ["COAT Status"]
 JUDGMENT_COLUMNS = []
 
 PROFILE_DIR = "coat_profile"                 # separate from the VinSolutions one
+BROWSER_CHANNEL = "msedge"   # "msedge" (Windows VDI / SSO) or "chrome"
+CDP_PORT = 9223              # 9222 is sf_audit's; keep them distinct
 HEADLESS = False
 WINDOW = {"width": 1920, "height": 1080}
 
@@ -85,6 +91,80 @@ VALUE_BOX = "[data-ids-react-component-name='ids-react-box']"
 LOG_FILE = "coat_log.txt"
 _APP_HOME = None        # resolved app URL after login (avoids re-hitting signin)
 _CACHE = {}             # CAID -> COAT status (one scrape per account per run)
+
+
+def get_browser_executable():
+    """Return the browser executable to drive, honouring BROWSER_CHANNEL.
+
+    On a Windows VDI, Conditional Access refuses a blank Chrome profile
+    because it cannot present device identity. Edge integrates with the
+    machine's PRT natively, so it passes where Chrome does not. Set
+    BROWSER_CHANNEL = "chrome" to go back to Chrome.
+    """
+    edge_first = BROWSER_CHANNEL == "msedge"
+    names = ["msedge", "chrome"] if edge_first else ["chrome", "msedge"]
+    candidates = []
+    for name in names:
+        if name == "msedge":
+            candidates += [shutil.which("msedge")]
+            if os.name == "nt":
+                roots = [
+                    os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                    os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                    os.environ.get("LOCALAPPDATA"),
+                ]
+                candidates += [
+                    str(Path(r) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+                    for r in roots if r
+                ]
+            elif sys.platform == "darwin":
+                candidates += [
+                    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                ]
+            else:
+                candidates += ["/usr/bin/microsoft-edge"]
+        else:
+            candidates += [
+                shutil.which("google-chrome"),
+                shutil.which("google-chrome-stable"),
+                shutil.which("chrome"),
+            ]
+            if os.name == "nt":
+                roots = [
+                    os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                    os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                    os.environ.get("LOCALAPPDATA"),
+                ]
+                candidates += [
+                    str(Path(r) / "Google" / "Chrome" / "Application" / "chrome.exe")
+                    for r in roots if r
+                ]
+            elif sys.platform == "darwin":
+                candidates += [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                ]
+            else:
+                candidates += ["/usr/bin/google-chrome", "/opt/google/chrome/chrome"]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    raise FileNotFoundError(
+        "Neither Microsoft Edge nor Google Chrome was found. "
+        "Install one or add it to PATH."
+    )
+
+
+# Backwards-compatible alias.
+get_chrome_executable = get_browser_executable
+
+
+def chrome_app_bundle(binary_path):
+    """Return the enclosing .app bundle for a Chrome binary, or None."""
+    for parent in Path(binary_path).parents:
+        if parent.suffix == ".app":
+            return str(parent)
+    return None
 
 # ======================================================================
 # LOGGING
@@ -516,18 +596,26 @@ def main():
     import subprocess
     from playwright.sync_api import sync_playwright
 
-    # Phase 1: open the browser WITHOUT Playwright so it runs at full speed
-    # while the user signs in and navigates to COAT manually.
-    pw_mgr = sync_playwright().start()
-    browser_path = pw_mgr.chromium.executable_path
-    pw_mgr.stop()
+    # Phase 1: open the installed Chrome browser directly so it runs at full
+    # speed while the user signs in and navigates to COAT manually.
+    browser_path = get_chrome_executable()
 
     profile_abs = str(Path(PROFILE_DIR).resolve())
+
+    # Phase 1: open the real browser so the user can sign in at full speed.
+    # A fixed CDP port lets Phase 2 attach to THIS SAME window instead of
+    # killing it and re-opening the profile. That matters on Windows, where
+    # the old kill-and-relaunch could not work: "pkill" does not exist, and
+    # the launcher process exits immediately after handing off to a detached
+    # browser, so proc.terminate() killed nothing and the profile stayed
+    # locked. Attaching avoids the whole problem on every platform - and it
+    # keeps the signed-in session live rather than relying on cookies having
+    # been flushed to disk.
     proc = subprocess.Popen([
         browser_path,
         f"--user-data-dir={profile_abs}",
         f"--window-size={WINDOW['width']},{WINDOW['height']}",
-        "--remote-debugging-port=0",     # let Chrome pick a free port
+        f"--remote-debugging-port={CDP_PORT}",
         MYAPPS_URL,
     ])
 
@@ -538,22 +626,25 @@ def main():
         "    - Sign in\n"
         "    - Open a new tab, paste the COAT link, click the app\n"
         "    - Navigate until you see the COAT search bar\n\n"
-        "  The browser is yours — full speed, no debugger.\n"
+        "  Leave the browser OPEN - this script attaches to it.\n"
         "  When the COAT search page is ready, type 'yes' and Enter: "
     )
-    proc.terminate()
-    proc.wait()
 
-    # Phase 2: now re-open the SAME profile with Playwright to automate.
-    # The SSO cookies from Phase 1 are saved in the profile.
+    # Phase 2: attach to the browser from Phase 1 over CDP.
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            PROFILE_DIR,
-            headless=HEADLESS,
-            viewport=WINDOW,
-            args=[f"--window-size={WINDOW['width']},{WINDOW['height']}"],
+        browser = p.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{CDP_PORT}",
+            timeout=30000,
         )
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = None
+        for pg in ctx.pages:
+            if "coat" in pg.url.lower():
+                page = pg
+                break
+        if page is None:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.bring_to_front()
 
         page = wait_for_login(page)   # finds COAT via saved session
 
@@ -567,7 +658,10 @@ def main():
             fill_row(page, row)
             write_rows(path, rows, fieldnames, delim)
 
-        ctx.close()
+        browser.close()   # detach from CDP; the window itself stays open
+
+    proc.terminate()      # close the browser window we launched in Phase 1
+    proc.wait()
     log.info("=== COAT audit run finished ===")
 
 
