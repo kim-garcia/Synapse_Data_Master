@@ -56,16 +56,31 @@ VIN_URL = "https://vinsolutions.app.coxautoinc.com/vinconnect"
 MAPPING_FILE = "SFXvsFulfillmentAuditMapping.csv"
 NAME_COL = "Name"
 FEATURE_IDS_COL = "Dealer Feature ID(s)"
-MATCH_ALL_FEATURE_IDS = True   # True = AND (all IDs must be enabled)
-                               # False = OR (any one ID enabled is enough)
+# Meaning of a BARE COMMA LIST in "Dealer Feature ID(s)", e.g.
+# "SVC-VINSCAN,SVC-VINATTACH" (no explicit AND/OR anywhere in the cell):
+#   False -> OR  (any one of the codes enabled is enough)   <-- business rule
+#   True  -> AND (every code must be enabled)
+# Cells that spell out AND / OR are always honoured as written; this only
+# decides what a comma on its own means.
+MATCH_ALL_FEATURE_IDS = False
+
+# Who decides "Vin Feature Enabled" when BOTH the mapping CSV and a hardcoded
+# PRODUCT_RULES entry cover the same product:
+#   True  -> the CSV wins; PRODUCT_RULES is only a fallback for products that
+#            are NOT in the CSV. The file is the single source of truth.
+#   False -> the old behaviour: PRODUCT_RULES overrides the CSV.
+MAPPING_FILE_WINS = True
 
 # Values written to the "Vin Feature Enabled" column:
 FEATURE_ENABLED_VALUE = "Yes"           # the feature is enabled
 FEATURE_NOT_FOUND_VALUE = "Not found"   # checked, but not enabled
 FEATURE_CHECK_VALUE = "Check manually"  # no rule and not found in the mapping CSV
 
-# Hardcoded per-product OVERRIDES. The FIRST rule whose "match" text appears in
-# PRODUCT_NAME wins. Kinds:
+# Hardcoded per-product rules. The FIRST rule whose "match" text appears in
+# PRODUCT_NAME wins. With MAPPING_FILE_WINS these are only a FALLBACK for
+# products missing from the mapping CSV - UNLESS the rule sets
+# "override_mapping": True, which makes it a documented business exception
+# that beats the CSV. Kinds:
 #   columns     -> decided from settings already read (all must equal value)
 #   min_numeric -> a settings value must be greater than the given number
 #   codes       -> decided from the Dealer Features list (mode AND or OR)
@@ -86,10 +101,15 @@ PRODUCT_RULES = [
     # Dealer Features list.
     {"match": "Customer Texting Unlimited MMS Texts",
      "codes": ["SVC-TXTMMSUNLMTD"], "codes_mode": "OR"},
-    # Automotive Marketing Platform (Direct Email Campaign): feature code only.
+    # Automotive Marketing Platform (Direct Email Campaign).
+    # BUSINESS EXCEPTION: the mapping CSV asks for
+    #   SVC-TARGETELITEWMS AND SVC-TARGETPRO AND SVC-DESKING1
+    # but only SVC-TARGETELITEWMS is actually required for this product to
+    # count as enabled. "override_mapping" keeps this rule ahead of the CSV.
     {"match": "Automotive Marketing Platform powered by VinSolutions "
               "(Direct Email Campaign)",
-     "codes": ["SVC-TARGETELITEWMS"], "codes_mode": "OR"},
+     "codes": ["SVC-TARGETELITEWMS"], "codes_mode": "OR",
+     "override_mapping": True},
     # ----- existing rules -----
     {"match": "CRM/ILM",
      "columns": [("Full Crm Status", "Yes"), ("ILM Status", "Yes")]},
@@ -274,23 +294,44 @@ def lookup_vinsolutions(page, key, row):
 
 
 def _determine_feature_enabled(page, key, row, result, selected_dealer):
-    """Set result['Vin Feature Enabled'] (hybrid model).
+    """Set result['Vin Feature Enabled'].
 
-      1. A hardcoded PRODUCT_RULES match wins - settings columns, or explicit
-         feature codes. These are our overrides.
-      2. Otherwise, look the product up by name in the mapping CSV and evaluate
-         its "Dealer Feature ID(s)" boolean expression.
+    With MAPPING_FILE_WINS (the default):
+      1. Look the product up by name in the mapping CSV and evaluate its
+         "Dealer Feature ID(s)" boolean expression. The file governs.
+      2. Only if the product is NOT in the file, fall back to a hardcoded
+         PRODUCT_RULES entry - settings columns, or explicit feature codes.
+      3. Neither -> "Check manually".
 
     Expression tokens are either CRM-column STATE tokens (tested against the
     values we already read) or feature codes (tested against the Dealer
-    Features enabled list). Operators: AND (all), OR (any), comma == AND.
-    Not in the mapping / unparseable -> "Check manually".
+    Features enabled list). Operators: AND (all), OR (any); a bare comma list
+    follows MATCH_ALL_FEATURE_IDS. Unparseable -> "Check manually".
     """
     product_name = (row.get("PRODUCT_NAME") or "").strip()
     rule = _match_rule(product_name)
+    expr = _lookup_expression(product_name)
+
+    # The CSV governs unless the product is missing from it, or a rule is
+    # flagged as a documented business exception.
+    exception = bool(rule and rule.get("override_mapping"))
+    use_mapping = bool(expr) and (MAPPING_FILE_WINS or not rule) and not exception
+    if exception:
+        log.info("[%s] rule %r is a business EXCEPTION - overriding mapping "
+                 "%r for %r", key, rule["match"], expr, product_name)
+    if use_mapping:
+        source = "mapping"
+        if rule:
+            log.info("[%s] mapping CSV overrides rule %r for %r",
+                     key, rule["match"], product_name)
+    elif not rule:
+        result["Vin Feature Enabled"] = FEATURE_CHECK_VALUE
+        log.info("[%s] no rule and no mapping for %r -> %s",
+                 key, product_name, FEATURE_CHECK_VALUE)
+        return
 
     # (a) hardcoded settings rule -> decide from columns already read; no page
-    if rule and ("columns" in rule or "min_numeric" in rule):
+    if not use_mapping and rule and ("columns" in rule or "min_numeric" in rule):
         col_checks = [(result.get(c, "") == v)
                       for c, v in rule.get("columns", [])]
         num_checks = [(_as_number(result.get(c, "")) > threshold)
@@ -309,19 +350,16 @@ def _determine_feature_enabled(page, key, row, result, selected_dealer):
                  key, result["Vin Feature Enabled"])
         return
 
-    # Build the boolean expression to evaluate.
-    if rule and "codes" in rule:                       # hardcoded code override
+    # Not using the CSV -> build the expression from the hardcoded rule.
+    if not use_mapping:
+        if "codes" not in rule:
+            result["Vin Feature Enabled"] = FEATURE_CHECK_VALUE
+            log.warning("[%s] rule %r has no usable check for %r -> %s",
+                        key, rule["match"], product_name, FEATURE_CHECK_VALUE)
+            return
         joiner = " OR " if rule.get("codes_mode", "OR").upper() == "OR" else " AND "
         expr = joiner.join(rule["codes"])
         source = "rule '%s'" % rule["match"]
-    else:                                              # mapping by product name
-        expr = _lookup_expression(product_name)
-        source = "mapping"
-        if not expr:
-            result["Vin Feature Enabled"] = FEATURE_CHECK_VALUE
-            log.info("[%s] no rule and no mapping for %r -> %s",
-                     key, product_name, FEATURE_CHECK_VALUE)
-            return
 
     mode, tokens = _parse_expression(expr)
     if mode is None or not tokens:
@@ -382,8 +420,11 @@ def _read_enabled_features(page, key, selected_dealer):
 def _parse_expression(expr):
     """Split a mapping expression into (mode, tokens).
 
-    mode is 'AND' or 'OR'; a comma is treated as AND. Mixed AND+OR is not
-    supported -> returns (None, []) so the caller flags it for review.
+    mode is 'AND' or 'OR'. An explicit AND / OR in the cell always wins. A
+    BARE comma list (no AND/OR at all) means whatever MATCH_ALL_FEATURE_IDS
+    says - by default OR, i.e. any one of the listed codes is enough. Mixed
+    AND+OR is not supported -> returns (None, []) so the caller flags it for
+    review.
     """
     e = (expr or "").strip()
     if not e:
@@ -393,11 +434,14 @@ def _parse_expression(expr):
     if has_or and has_and:
         return None, []
     if has_or:
-        parts = re.split(r"\bOR\b", e)
+        parts = re.split(r"\bOR\b|,", e)
         mode = "OR"
-    else:
-        parts = re.split(r"\bAND\b|,", e)   # comma == AND
+    elif has_and:
+        parts = re.split(r"\bAND\b|,", e)
         mode = "AND"
+    else:                                    # bare comma list, e.g. "A,B"
+        parts = e.split(",")
+        mode = "AND" if MATCH_ALL_FEATURE_IDS else "OR"
     tokens = [p.strip() for p in parts if p.strip()]
     return mode, tokens
 
@@ -569,6 +613,18 @@ def load_mapping():
             data.append((name, expr))
     _MAPPING = data
     log.info("loaded %d mapping rows from %s", len(_MAPPING), MAPPING_FILE)
+
+    # The same product listed twice with DIFFERENT expressions is a data bug:
+    # _lookup_expression returns the first one in file order, so the result
+    # depends on row order rather than on the rule. Surface it loudly.
+    by_name = {}
+    for name, expr in data:
+        by_name.setdefault(name.strip().lower(), set()).add(expr.strip())
+    for name, exprs in by_name.items():
+        if len(exprs) > 1:
+            log.warning("mapping conflict: %r has %d different expressions %s "
+                        "- using the first one found in the file",
+                        name, len(exprs), sorted(exprs))
 
 
 def _lookup_expression(product_name):
