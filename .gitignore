@@ -86,5 +86,8 @@ run_status.json
 
 # Internal documents (uncomment to share with the team)
 *.pdf
-# Mapping table is reference data, not output - keep it tracked
-SFXvsFulfillmentAuditMapping.csv
+# Mapping table is reference data, not output - keep it tracked.
+# The leading '!' is REQUIRED: it un-ignores the file from the '*.csv' rule
+# above. Without it the file never reaches the VDI and every product falls
+# back to 'Check manually'.
+!SFXvsFulfillmentAuditMapping.csv

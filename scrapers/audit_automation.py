@@ -71,6 +71,12 @@ MATCH_ALL_FEATURE_IDS = False
 #   False -> the old behaviour: PRODUCT_RULES overrides the CSV.
 MAPPING_FILE_WINS = True
 
+# The mapping CSV is now the source of truth, so running without it produces
+# 100% wrong output ("Check manually" everywhere) instead of a few gaps.
+# True = stop immediately with a clear error instead of auditing with no
+# mapping. Set to False only if you deliberately want the old silent fallback.
+REQUIRE_MAPPING_FILE = True
+
 # Values written to the "Vin Feature Enabled" column:
 FEATURE_ENABLED_VALUE = "Yes"           # the feature is enabled
 FEATURE_NOT_FOUND_VALUE = "Not found"   # checked, but not enabled
@@ -594,7 +600,15 @@ def load_mapping():
     global _MAPPING
     path = Path(MAPPING_FILE)
     if not path.exists():
-        log.warning("mapping file not found: %s (fallback disabled)", MAPPING_FILE)
+        msg = (f"mapping file not found: {MAPPING_FILE}\n"
+               f"  looked in: {path.resolve().parent}\n"
+               f"  Put {MAPPING_FILE} in the folder you run this script FROM\n"
+               f"  (the same folder as {CSV_PATH}). Without it every product\n"
+               f"  falls back to '{FEATURE_CHECK_VALUE}' and the audit is wrong.")
+        if REQUIRE_MAPPING_FILE:
+            log.error(msg)
+            sys.exit(msg)
+        log.warning("%s (fallback disabled)", msg)
         _MAPPING = []
         return
     data = []
