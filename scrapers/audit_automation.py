@@ -77,6 +77,20 @@ MAPPING_FILE_WINS = True
 # mapping. Set to False only if you deliberately want the old silent fallback.
 REQUIRE_MAPPING_FILE = True
 
+# ---- Reliability ------------------------------------------------------
+# A dealer page that times out used to leave the row blank and move on, which
+# is why rows came back as "Not audited" and needed a human check. Now each
+# row is retried inside the pass, and the whole CSV gets extra sweeps at the
+# end for whatever is still incomplete (transient timeouts usually clear on a
+# later pass, once the session has settled).
+ROW_ATTEMPTS = 2              # tries per row within a single pass
+RETRY_BACKOFF_SECONDS = 3     # wait between tries, multiplied by the try number
+FINAL_SWEEPS = 2              # extra passes over rows that are still not done
+# Written into "VIN Account Status" when a row still fails after every retry,
+# so validate_audit.py flags it as "Review" instead of leaving it silently
+# blank as "Not audited". Set to "" to keep the old blank behaviour.
+AUDIT_FAILED_VALUE = "Audit failed"
+
 # Values written to the "Vin Feature Enabled" column:
 FEATURE_ENABLED_VALUE = "Yes"           # the feature is enabled
 FEATURE_NOT_FOUND_VALUE = "Not found"   # checked, but not enabled
@@ -876,26 +890,85 @@ def get_key(row):
     return (row.get(FALLBACK_KEY_COLUMN) or "").strip()
 
 
-def fill_row(page, row):
+def missing_columns(row):
+    """Which LOOKUP_COLUMNS are still blank on this row."""
+    return [c for c in LOOKUP_COLUMNS if not (row.get(c) or "").strip()]
+
+
+def fill_row(page, row, attempts=None):
+    """Fill one row, retrying the whole lookup when the page misbehaves.
+
+    A single timeout used to blank the row for good; now we try again before
+    giving up. Returns True when the row came back complete.
+    """
     key = get_key(row)
     if not key:
         log.warning("row missing both %s and %s, skipping",
                     KEY_COLUMN, FALLBACK_KEY_COLUMN)
-        return row
-    for system in SYSTEMS:
-        try:
-            found = system(page, key, row) or {}
-        except SystemExit:
-            raise
-        except Exception as e:
-            log.exception("[%s] unexpected error: %s", key, e)
-            found = {}
-        for col, val in found.items():
-            if col in JUDGMENT_COLUMNS:
-                continue
-            if col in row:
-                row[col] = val
-    return row
+        return False
+
+    attempts = attempts or ROW_ATTEMPTS
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        for system in SYSTEMS:
+            try:
+                found = system(page, key, row) or {}
+                last_error = None
+            except SystemExit:
+                raise
+            except Exception as e:
+                last_error = e
+                log.warning("[%s] attempt %d/%d failed: %s",
+                            key, attempt, attempts, e)
+                found = {}
+            for col, val in found.items():
+                if col in JUDGMENT_COLUMNS:
+                    continue
+                if col in row:
+                    row[col] = val
+
+        if row_is_done(row):
+            if attempt > 1:
+                log.info("[%s] recovered on attempt %d", key, attempt)
+            return True
+        if attempt < attempts:
+            wait = RETRY_BACKOFF_SECONDS * attempt
+            log.info("[%s] incomplete (missing %s), retrying in %ds",
+                     key, missing_columns(row), wait)
+            time.sleep(wait)
+
+    if last_error:
+        log.error("[%s] gave up after %d attempt(s): %s",
+                  key, attempts, last_error)
+    else:
+        log.warning("[%s] still incomplete after %d attempt(s), missing %s",
+                    key, attempts, missing_columns(row))
+    return False
+
+
+def report_incomplete(rows):
+    """Mark and list every row that never came back complete, so no row is
+    silently blank. Returns the rows still missing data."""
+    nokey = [r for r in rows if not get_key(r)]
+    if nokey:
+        log.warning("%d row(s) have neither %s nor %s - never audited",
+                    len(nokey), KEY_COLUMN, FALLBACK_KEY_COLUMN)
+
+    stuck = [r for r in rows if get_key(r) and not row_is_done(r)]
+    audited = len(rows) - len(nokey)
+    if not stuck:
+        log.info("COVERAGE: %d/%d rows with a key completed (100%%)",
+                 audited, audited)
+        return stuck
+
+    pct = 100.0 * (audited - len(stuck)) / audited if audited else 0.0
+    log.warning("COVERAGE: %d/%d rows completed (%.1f%%); %d still incomplete:",
+                audited - len(stuck), audited, pct, len(stuck))
+    for r in stuck:
+        log.warning("   %s missing %s", get_key(r), missing_columns(r))
+        if AUDIT_FAILED_VALUE and not (r.get("VIN Account Status") or "").strip():
+            r["VIN Account Status"] = AUDIT_FAILED_VALUE
+    return stuck
 
 
 def main():
@@ -958,6 +1031,24 @@ def main():
             write_rows(path, rows, fieldnames, delim)
             time.sleep(0.5)
 
+        # Extra sweeps over whatever is still incomplete. A dealer page that
+        # timed out mid-run very often loads fine on a later pass, so this is
+        # what turns "Not audited" rows into real results.
+        for sweep in range(1, FINAL_SWEEPS + 1):
+            pending = [r for r in rows if get_key(r) and not row_is_done(r)]
+            if not pending:
+                break
+            log.info("=== sweep %d/%d: retrying %d incomplete row(s) ===",
+                     sweep, FINAL_SWEEPS, len(pending))
+            for j, row in enumerate(pending, 1):
+                log.info("[sweep %d - %d/%d] === %s ===",
+                         sweep, j, len(pending), get_key(row))
+                fill_row(page, row)
+                write_rows(path, rows, fieldnames, delim)
+                time.sleep(0.5)
+
+        report_incomplete(rows)
+        write_rows(path, rows, fieldnames, delim)
         ctx.close()
     log.info("=== audit run finished ===")
 
